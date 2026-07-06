@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 const (
@@ -24,14 +25,31 @@ const (
 // quadNode is one node in the tree. It's either a leaf (holds points)
 // or internal (holds 4 child nodes). Never both at the same time.
 type quadNode struct {
-	mu       sync.RWMutex
-	bounds   BoundingBox
-	state    nodeState
-	points   []Point     // non-nil only when stateLeaf
-	children [4]*quadNode // non-nil only when stateInternal
-	cacheKey string      // set when stateEvicted
-	depth    uint8
-	count    int64 // total points in this subtree (atomic)
+	mu         sync.RWMutex
+	bounds     BoundingBox
+	state      nodeState
+	points     []Point      // non-nil only when stateLeaf
+	children   [4]*quadNode // non-nil only when stateInternal
+	cacheKey   string       // set when stateEvicted
+	depth      uint8
+	count      int64 // total points in this subtree (atomic)
+	lastAccess int64 // unix nanoseconds of last insert/query touch (atomic)
+}
+
+// touch records that this leaf was just read or written, for idle-based
+// eviction decisions.
+func (n *quadNode) touch() {
+	atomic.StoreInt64(&n.lastAccess, time.Now().UnixNano())
+}
+
+// Cache is the interface a QuadTree uses to offload cold leaf nodes out of
+// process memory (e.g. to Redis) and reload them on demand. Decoupling the
+// tree from any specific backend keeps internal/spatial free of Redis
+// (or any other store) dependencies.
+type Cache interface {
+	Store(key string, points []Point) error
+	Load(key string) ([]Point, error)
+	Delete(key string) error
 }
 
 // QuadTree is the top-level concurrent spatial index.
@@ -43,23 +61,31 @@ type QuadTree struct {
 	capacity int
 	maxDepth uint8
 
-	// evictor is called when a cold node should be pushed to Redis.
-	// Nil means eviction is disabled (Phase 1 — no Redis yet).
-	evictor func(node *quadNode) error
-	loader  func(cacheKey string) (*quadNode, error)
+	// cache handles evicting cold leaves out of memory and reloading them.
+	// Nil means eviction is disabled.
+	cache    Cache
+	cacheSeq uint64 // atomic counter for generating unique cache keys
 }
 
 // NewQuadTree creates a tree covering the given bounds.
 func NewQuadTree(bounds BoundingBox) *QuadTree {
+	root := &quadNode{
+		bounds: bounds,
+		state:  stateLeaf,
+		points: make([]Point, 0, DefaultCapacity),
+	}
+	root.touch()
 	return &QuadTree{
-		root: &quadNode{
-			bounds: bounds,
-			state:  stateLeaf,
-			points: make([]Point, 0, DefaultCapacity),
-		},
+		root:     root,
 		capacity: DefaultCapacity,
 		maxDepth: DefaultMaxDepth,
 	}
+}
+
+// SetCache attaches a Cache backend, enabling EvictIdle. Not safe to call
+// concurrently with tree mutations.
+func (qt *QuadTree) SetCache(c Cache) {
+	qt.cache = c
 }
 
 // Insert adds a point to the tree. Thread-safe — multiple goroutines
@@ -102,6 +128,7 @@ func (qt *QuadTree) insert(node *quadNode, p Point) error {
 
 		node.points = append(node.points, p)
 		atomic.AddInt64(&node.count, 1)
+		node.touch()
 
 		// Split if over capacity and not at max depth.
 		if len(node.points) > qt.capacity && node.depth < qt.maxDepth {
@@ -111,21 +138,33 @@ func (qt *QuadTree) insert(node *quadNode, p Point) error {
 		return nil
 
 	case stateEvicted:
-		// Node was evicted to Redis. Reload it first (Phase 2).
-		if qt.loader == nil {
-			return fmt.Errorf("node is evicted but no loader configured")
+		if err := qt.reload(node); err != nil {
+			return err
 		}
-		loaded, err := qt.loader(node.cacheKey)
-		if err != nil {
-			return fmt.Errorf("reload evicted node: %w", err)
-		}
-		node.mu.Lock()
-		node.points = loaded.points
-		node.state = stateLeaf
-		node.cacheKey = ""
-		node.mu.Unlock()
 		return qt.insert(node, p)
 	}
+	return nil
+}
+
+// reload fetches an evicted node's points back from the cache and restores
+// it to stateLeaf. Caller must NOT hold node.mu.
+func (qt *QuadTree) reload(node *quadNode) error {
+	if qt.cache == nil {
+		return fmt.Errorf("node is evicted but no cache configured")
+	}
+	node.mu.Lock()
+	defer node.mu.Unlock()
+	if node.state != stateEvicted {
+		return nil // another goroutine already reloaded it
+	}
+	points, err := qt.cache.Load(node.cacheKey)
+	if err != nil {
+		return fmt.Errorf("reload evicted node: %w", err)
+	}
+	node.points = points
+	node.state = stateLeaf
+	node.cacheKey = ""
+	node.touch()
 	return nil
 }
 
@@ -140,6 +179,7 @@ func (qt *QuadTree) split(node *quadNode) {
 			points: make([]Point, 0, qt.capacity),
 			depth:  node.depth + 1,
 		}
+		node.children[i].touch()
 	}
 	// Redistribute existing points into children.
 	for _, p := range node.points {
@@ -189,6 +229,7 @@ func (qt *QuadTree) rangeQuery(node *quadNode, bb BoundingBox, results *[]Point)
 
 	switch node.state {
 	case stateLeaf:
+		node.touch()
 		for _, p := range node.points {
 			if bb.Contains(p) {
 				*results = append(*results, p)
@@ -205,17 +246,14 @@ func (qt *QuadTree) rangeQuery(node *quadNode, bb BoundingBox, results *[]Point)
 		}
 
 	case stateEvicted:
-		if qt.loader == nil {
-			return fmt.Errorf("node evicted but no loader configured")
-		}
-		// Release read lock before loading (loader may need a write lock).
+		// Release read lock before reload (which needs a write lock).
 		node.mu.RUnlock()
-		loaded, err := qt.loader(node.cacheKey)
+		err := qt.reload(node)
 		node.mu.RLock()
 		if err != nil {
-			return fmt.Errorf("reload evicted node: %w", err)
+			return err
 		}
-		for _, p := range loaded.points {
+		for _, p := range node.points {
 			if bb.Contains(p) {
 				*results = append(*results, p)
 			}
@@ -247,4 +285,55 @@ func countLeaves(node *quadNode) int {
 		}
 	}
 	return total
+}
+
+// EvictIdle walks the tree and evicts every leaf whose last insert/query
+// touch is older than idleFor, pushing its points to the cache and freeing
+// them from process memory. Requires SetCache to have been called first.
+// Returns the number of leaves evicted.
+func (qt *QuadTree) EvictIdle(idleFor time.Duration) (int, error) {
+	if qt.cache == nil {
+		return 0, fmt.Errorf("EvictIdle: no cache configured, call SetCache first")
+	}
+	cutoff := time.Now().Add(-idleFor).UnixNano()
+	return qt.evictIdle(qt.root, cutoff)
+}
+
+func (qt *QuadTree) evictIdle(node *quadNode, cutoff int64) (int, error) {
+	node.mu.RLock()
+	state := node.state
+	node.mu.RUnlock()
+
+	if state == stateInternal {
+		total := 0
+		for _, child := range node.children {
+			if child != nil {
+				n, err := qt.evictIdle(child, cutoff)
+				total += n
+				if err != nil {
+					return total, err
+				}
+			}
+		}
+		return total, nil
+	}
+
+	if state != stateLeaf {
+		return 0, nil // already evicted
+	}
+
+	node.mu.Lock()
+	defer node.mu.Unlock()
+	if node.state != stateLeaf || atomic.LoadInt64(&node.lastAccess) > cutoff || len(node.points) == 0 {
+		return 0, nil
+	}
+
+	key := fmt.Sprintf("quadtree-node-%d", atomic.AddUint64(&qt.cacheSeq, 1))
+	if err := qt.cache.Store(key, node.points); err != nil {
+		return 0, fmt.Errorf("evict node: %w", err)
+	}
+	node.points = nil
+	node.cacheKey = key
+	node.state = stateEvicted
+	return 1, nil
 }
