@@ -63,9 +63,25 @@ User has access to a Slurm/PBS batch cluster. Plan: develop and correctness-test
 
 **Phase A closed out (2026-07-06).** Removed dead scaffolding (`cmd/spatialscale-rest`, `internal/arrow`, `internal/server`, `docs/`) and documented the gRPC message-size cap as an intentional limitation rather than an open bug (see "Known limitation" above). All resume claims now have real-data evidence. Phase B (AWS: EKS/S3/ElastiCache/NLB/Auto Scaling) starts next.
 
-## Phase B — AWS (deferred, not started)
+## Phase B — AWS (in progress)
 
-EKS deployment, S3-backed point storage, ElastiCache (managed Redis) replacing local Redis, NLB in front of the gRPC service, Auto Scaling + failover testing to back "99.99% availability." Does not begin until Phase A numbers are real.
+EKS deployment, S3-backed point storage, ElastiCache (managed Redis) replacing local Redis, NLB in front of the gRPC service, Auto Scaling + failover testing to back "99.99% availability." Terraform for the minimal footprint (EKS + node group + ElastiCache + S3, public subnets, no NAT gateway) lives in `deploy/terraform/environments/dev` — see `ARCHITECTURE.md` for the full topology diagram and design decisions.
+
+**Phase B definition of done (in order):**
+1. `terraform apply` the AWS footprint.
+2. Containerize `spatialscale-server` (Dockerfile), push to ECR.
+3. Deploy via `deploy/helm/spatialscale`, expose via a `type: LoadBalancer` Service (this is what creates the NLB — not Terraform).
+4. **Re-baseline `cmd/benchclient` against the real NLB address immediately after deploy, before declaring Phase B numbers good.** Phase A's sub-10ms p99 was measured over localhost gRPC — real AWS network hops (NLB → pod, pod → ElastiCache on a cache miss) are a new variable that didn't exist locally and could regress the number. Don't assume it holds; measure it the same way Phase A did (real client, real traffic, no synthetic shortcuts).
+5. If latency regresses versus the Phase A localhost numbers, work down this list in order, stopping as soon as the target is met — no speculative optimization beyond what's needed:
+   - Confirm pods and the ElastiCache node land in the same AZ (cross-AZ adds real round-trip cost); adjust subnet/scheduling if not.
+   - Loosen `EvictIdle`'s idle threshold (evict less aggressively) if node memory allows — a cache miss now costs a real network round trip to ElastiCache instead of a localhost one, so the memory/latency trade shifts.
+   - Check NLB target group health check interval if failover/availability numbers look off.
+   - Only if cold-cache reload shows up as a real p99 tail: batch-reload neighboring leaves on a miss instead of one at a time.
+   - Only if ingestion time becomes part of a latency-sensitive path (e.g. pod cold start re-ingesting data): parallelize the currently single-threaded CSV parse/aggregate step (confirmed single-threaded via the Alpine HPC run — ~1.16 cores average over 6m42s).
+6. Auto Scaling + failover test (kill a pod, measure client-visible error rate/recovery time) — the real evidence for "99.99% availability," not just infra existing.
+7. `terraform destroy` once measurements are captured — this stack is not meant to run continuously (see cost discussion below).
+
+Does not begin until Phase A numbers are real — confirmed done, see "Phase A closed out" above.
 
 ## Research use-case narrative
 
