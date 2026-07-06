@@ -29,9 +29,13 @@ Cloud-native distributed spatial query engine (Go). Target end-state (resume goa
 - **Full-scale HPC ingestion run — the real "500M+ points" scale-proof artifact** (`deploy/slurm/ingest_full.sbatch`, run on CU Boulder's Alpine cluster, `amilan` partition, 18 CPUs / 64GB mem, Slurm job 29669960, 2026-07-06): ingested the complete real 155M-row `transcripts.csv` (no sampling, no synthetic data). Result: **148,583,090 aggregated (position, gene) points**, **6,168,484 quadtree partitions**, bounds `{MinX:8 MinY:764 MaxX:2750 MaxY:15167}`. Wall clock **6m42s**, user CPU 461.91s (~1.16 cores average — loader is single-threaded, parallelizable later if needed), **peak RSS 50.57 GB** (`/usr/bin/time -v`), exit 0, no swaps. This is real evidence a single quadtree instance handles ~150M points end-to-end; multiple tissue samples/sections would straightforwardly exceed 500M points post-aggregation (or the raw 155M-row read count already does, pre-aggregation). The 50.57GB peak RSS for one in-memory quadtree is also the strongest concrete motivation yet for the Redis eviction work (Status above) at real scale, not just the 480K-point sample. Cluster setup notes: no `go` environment module exists on Alpine (`module spider go` finds nothing) — installed via `conda create -n gobuild -c conda-forge go -y` instead (got go1.26.4 linux/amd64). Conda's Go toolchain defaults to `CGO_ENABLED=1` and fails with `cgo: C compiler "x86_64-conda-linux-gnu-cc" not found` since no C compiler is in the conda env — fixed by building with `CGO_ENABLED=0` (nothing in SpatiaScale needs cgo), not by installing a compiler. Use `CGO_ENABLED=0` for all builds/runs on this cluster.
 
 ### Scaffolded but empty (planned, not implemented)
-- `cmd/spatialscale-rest`
-- `internal/arrow`, `internal/server`
-- `deploy/`, `docs/`
+- `deploy/helm`, `deploy/terraform` — Phase B (EKS) placeholders.
+
+`cmd/spatialscale-rest`, `internal/arrow`, `internal/server`, and `docs/` were removed (2026-07-06) — never implemented, nothing referenced them, and Arrow is already proven via the standalone `benchmarks/serialization/` benchmark rather than needing its own package.
+
+### Known limitation: gRPC message size cap
+
+`RangeQuery` has no pagination or streaming. Both client and server are bounded by gRPC's default 4MB message size unless raised (`benchclient` raises its recv limit to 64MB; the server does not set `MaxSendMsgSize`, so a sufficiently large result set can still fail server-side). This is an accepted, intentional limitation for Phase A, not a bug to fix: queries are meant to be region-scoped (see Research use-case narrative below), not full-dataset dumps. Revisit only if a real use case needs bulk export.
 
 ## Data pipeline decisions
 
@@ -56,6 +60,8 @@ User has access to a Slurm/PBS batch cluster. Plan: develop and correctness-test
 5. ~~`internal/metrics`~~ — **Done.** `internal/metrics.LatencyRecorder` (thread-safe sample recorder + percentile calc, unit-tested), wired into `internal/query.Service.RangeQuery` (`Service.Latency` field, timed via `defer`). Real p50/p90/p99 measured with `cmd/benchclient` — see Status above for numbers and the box-size caveat.
 6. ~~Run at scale on the HPC cluster~~ — **Done.** `deploy/slurm/ingest_full.sbatch` run on Alpine (Slurm), full real 155M-row file, no sampling. 148,583,090 aggregated points, 6,168,484 partitions, 6m42s wall clock, 50.57GB peak RSS. See Status above for full numbers.
 7. ~~`cmd/benchclient`~~ — **Done.** Load-generation client: N concurrent goroutines firing randomly-placed RangeQuery calls at a running `spatialscale-server`, reports p50/p90/p99 round-trip latency (client-side, so it includes real network + gRPC marshaling cost, not just in-process tree lookup). `-box-frac` controls query box size relative to the full data extent.
+
+**Phase A closed out (2026-07-06).** Removed dead scaffolding (`cmd/spatialscale-rest`, `internal/arrow`, `internal/server`, `docs/`) and documented the gRPC message-size cap as an intentional limitation rather than an open bug (see "Known limitation" above). All resume claims now have real-data evidence. Phase B (AWS: EKS/S3/ElastiCache/NLB/Auto Scaling) starts next.
 
 ## Phase B — AWS (deferred, not started)
 
