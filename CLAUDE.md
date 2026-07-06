@@ -16,13 +16,16 @@ Cloud-native distributed spatial query engine (Go). Target end-state (resume goa
 - `internal/storage/transcripts.go` — `LoadTranscripts(io.Reader)` extracted from `cmd/datagen` so both the CLI and the benchmark package can load real transcript data without duplicating CSV-parsing logic.
 - `cmd/datagen/main.go` — thin CLI wrapper around `storage.LoadTranscripts`, loads into a `QuadTree`. Validated against a 500K-row real slice (Cygb: 79 raw detections → 78 aggregated groups, total count preserved).
 - **Biological validation passed** — `scripts/plot_markers.py` reservoir-samples rows uniformly across the full 155M-row file (pure first-N sampling is spatially biased since Xenium output is FOV-ordered, not spatially ordered) and plots all transcripts plus 4 canonical mouse brain markers (`Snap25` pan-neuronal, `Slc17a7` excitatory, `Gad1` inhibitory, `Gfap` astrocyte). Result: the point cloud traces a real anatomical tissue outline (not noise), marker gene relative abundances are biologically plausible (Snap25 most abundant, matching that most brain cells are neurons), and Gad1+ inhibitory neurons show a visibly denser, spatially distinct cluster rather than being uniformly spread — confirms the ingestion pipeline preserves real biological signal end to end. Run with `python3 scripts/plot_markers.py transcripts.csv --sample 1000000` (takes ~13 min in pure Python over 155M rows) or `--head` on `testdata/transcripts_sample.csv` for a fast but spatially-biased preview.
+- `proto/spatialscale.proto` + generated `proto/spatialscalepb/` — `SpatialQuery` gRPC service, single `RangeQuery(bounding box, optional gene)` RPC. Codegen via `protoc --go_out=... --go-grpc_out=...` (protoc + Go plugins installed via Chocolatey).
+- `internal/query/service.go` — `Service` implements `pb.SpatialQueryServer.RangeQuery` over a preloaded `*spatial.QuadTree`: runs the box query, then filters by exact gene name (matches the `"<gene>:<count>"` Payload prefix up to the `:`, empty gene string = no filter). Unit-tested (`internal/query/service_test.go`), including a prefix-collision case (`Cygb` must not match `Cygb2`).
+- `cmd/spatialscale-server/main.go` — loads the CSV once at startup via `storage.LoadTranscripts`, builds the quadtree, then serves `SpatialQueryServer` over plain gRPC (`grpc.NewServer()`, no TLS yet — local only). Flags: `-csv`, `-addr` (default `:50051`).
+- **Server smoke-tested end-to-end** against `testdata/transcripts_sample.csv`: loaded 480,982 points, wide-open `RangeQuery` returned all 480,982, gene-filtered `RangeQuery(gene="Cygb")` returned exactly 78 — matching the previously-validated aggregation count.
+- **Known constraint found during smoke test**: gRPC's default max receive message size is 4MB; a wide-open `RangeQuery` over ~480K points serializes to ~15MB and is rejected client-side unless the client raises `grpc.MaxCallRecvMsgSize`. At full 155M-row scale this will matter for real — either the client must always raise the limit, or (better, later) the RPC should support pagination/streaming so a query over a huge region doesn't require one giant message. Not fixed yet since Phase A queries are meant to be region-scoped (see Research use-case narrative), but worth revisiting when building `cmd/benchclient`.
 
 ### Scaffolded but empty (planned, not implemented)
-- `cmd/spatialscale-server`, `cmd/spatialscale-rest`, `cmd/benchclient`
-- `internal/arrow`, `internal/cache`, `internal/metrics`, `internal/query`, `internal/server`
-- `proto/`, `deploy/`, `docs/`
-
-No git repo yet.
+- `cmd/spatialscale-rest`, `cmd/benchclient`
+- `internal/arrow`, `internal/cache`, `internal/metrics`, `internal/server`
+- `deploy/`, `docs/`
 
 ## Data pipeline decisions
 
@@ -42,7 +45,7 @@ User has access to a Slurm/PBS batch cluster. Plan: develop and correctness-test
 
 1. ~~Validate the loader~~ — **Done.**
 2. ~~Fix the Arrow benchmark build and rerun on real data~~ — **Done.** See Status above for numbers.
-3. **Build `internal/query` + `cmd/spatialscale-server`** — gRPC service wrapping the quadtree (`Insert`/`RangeQuery` RPCs, Arrow-encoded wire payloads), done locally first, no NLB yet.
+3. ~~Build `internal/query` + `cmd/spatialscale-server`~~ — **Done.** gRPC `RangeQuery` service (bounding box + optional gene filter) over a preloaded quadtree, smoke-tested end-to-end on real data. Wire payloads are plain protobuf for now, not Arrow-encoded — Arrow-over-gRPC would be a later refinement if serialization cost on the query path actually matters (the "5x speedup" claim is already backed by the standalone benchmark, not by this RPC).
 4. **Wire real Redis into `internal/cache`** — replace the `evictor`/`loader` stubs in `internal/spatial/quadtree.go` with an actual Redis client (local Docker Redis is fine), then measure memory before/after eviction under a dense-query workload on real data — evidence for "cutting memory 40%."
 5. **`internal/metrics`** — instrument p99 latency for RangeQuery so "sub-10ms p99" is a measured number.
 6. **Run at scale on the HPC cluster** — package the above as an sbatch job, run the full dataset (or multiple samples to exceed 500M points), capture logs as the scale-proof artifact.
