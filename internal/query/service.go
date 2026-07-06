@@ -5,7 +5,9 @@ package query
 import (
 	"bytes"
 	"context"
+	"time"
 
+	"github.com/yaseer/spatialscale/internal/metrics"
 	"github.com/yaseer/spatialscale/internal/spatial"
 	pb "github.com/yaseer/spatialscale/proto/spatialscalepb"
 )
@@ -13,14 +15,18 @@ import (
 // Service implements pb.SpatialQueryServer over a preloaded QuadTree.
 type Service struct {
 	pb.UnimplementedSpatialQueryServer
-	tree *spatial.QuadTree
+	tree    *spatial.QuadTree
+	Latency *metrics.LatencyRecorder
 }
 
 func NewService(tree *spatial.QuadTree) *Service {
-	return &Service{tree: tree}
+	return &Service{tree: tree, Latency: metrics.NewLatencyRecorder()}
 }
 
 func (s *Service) RangeQuery(ctx context.Context, req *pb.RangeQueryRequest) (*pb.RangeQueryResponse, error) {
+	start := time.Now()
+	defer func() { s.Latency.Record(time.Since(start)) }()
+
 	box := spatial.BoundingBox{
 		MinX: req.Box.MinX, MinY: req.Box.MinY,
 		MaxX: req.Box.MaxX, MaxY: req.Box.MaxY,
