@@ -1,0 +1,5 @@
+transcripts.csv
+testdata/
+marker_plot.png
+*.exe
+.claude/

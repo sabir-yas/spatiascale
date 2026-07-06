@@ -1,0 +1,36 @@
+syntax = "proto3";
+
+package spatialscale;
+
+option go_package = "github.com/yaseer/spatialscale/proto/spatialscalepb";
+
+// SpatialQuery serves range queries over a preloaded QuadTree.
+service SpatialQuery {
+  // RangeQuery returns all points within the given bounding box,
+  // optionally filtered to a single gene name.
+  rpc RangeQuery(RangeQueryRequest) returns (RangeQueryResponse);
+}
+
+message BoundingBox {
+  double min_x = 1;
+  double min_y = 2;
+  double max_x = 3;
+  double max_y = 4;
+}
+
+message RangeQueryRequest {
+  BoundingBox box = 1;
+  // Optional exact gene name match. Empty string matches all genes.
+  string gene = 2;
+}
+
+message Point {
+  uint64 id = 1;
+  double x = 2;
+  double y = 3;
+  bytes payload = 4;
+}
+
+message RangeQueryResponse {
+  repeated Point points = 1;
+}
