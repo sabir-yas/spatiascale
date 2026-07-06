@@ -1,0 +1,7 @@
+transcripts.csv
+testdata/*
+!testdata/transcripts_sample.csv
+marker_plot.png
+.git/
+deploy/
+*.log

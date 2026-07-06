@@ -1,0 +1,25 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: spatialscale-server
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: spatialscale-server
+  template:
+    metadata:
+      labels:
+        app: spatialscale-server
+    spec:
+      containers:
+        - name: spatialscale-server
+          image: 437040615366.dkr.ecr.us-east-1.amazonaws.com/spatiascale-server:latest
+          ports:
+            - containerPort: 50051
+          resources:
+            requests:
+              cpu: 250m
+              memory: 256Mi
+            limits:
+              memory: 512Mi
